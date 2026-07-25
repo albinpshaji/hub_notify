@@ -8,6 +8,7 @@ Students: implement the retry delay logic and the actual channel dispatch.
 import asyncio
 import json
 import logging
+import uuid
 
 import aio_pika
 
@@ -19,13 +20,8 @@ from app.config import settings
 from app.queue.producer import publish
 from app.queue.schemas import NotifyPayload
 
-# Configure logging at import time so log output appears regardless of
-# whether this module is run directly (`python -m app.queue.consumer`)
-# or imported and started as a background task inside uvicorn (main.py's
-# lifespan). Previously this was only called inside `if __name__ == "__main__"`,
-# which meant the embedded consumer (started via import) had no logging
-# handler/level configured and silently dropped all INFO-level logs.
-logging.basicConfig(level=logging.INFO)
+from app.database import async_session
+from app.models import NotificationJob, IndividualNotification
 
 logger = logging.getLogger(__name__)
 
@@ -43,46 +39,234 @@ async def dispatch(payload: NotifyPayload) -> None:
                 html_body=payload.html_body,
             )
         case "sms":
-            # Made this awaitable if send_sms is an async function in your project
-            await send_sms(to=payload.recipient, body=payload.body)
+            send_sms(to=payload.recipient, body=payload.body)
         case "push":
-            # Triggers your Firebase delivery logic using the saved FCM tokens!
-            await send_push(
+            send_push(
                 device_token=payload.recipient,
                 title=payload.title or "CixioHub",
                 body=payload.body,
                 data=payload.data,
             )
         case "whatsapp":
-            await send_whatsapp(to=payload.recipient, body=payload.body)
+            send_whatsapp(to=payload.recipient, body=payload.body)
         case _:
             raise ValueError(f"Unknown channel: {payload.channel}")
 
 
-async def process_message(message: aio_pika.IncomingMessage) -> None:
+async def process_priority_message(message: aio_pika.IncomingMessage) -> None:
+    # Set requeue=False so that if exception is raised, it is rejected
     async with message.process(requeue=False):
-        payload = NotifyPayload(**json.loads(message.body))
+        body_dict = json.loads(message.body.decode())
+        msg_str = json.dumps(body_dict, indent=2)
+        print(f"\n[PRIORITY QUEUE] Received message: {msg_str}\n")
+
+        # Check if job_id and notification_id present, else generate them
+        if not body_dict.get("job_id"):
+            body_dict["job_id"] = str(uuid.uuid4())
+        if not body_dict.get("notification_id"):
+            body_dict["notification_id"] = str(uuid.uuid4())
+
+        payload = NotifyPayload(**body_dict)
+
+        # Ensure the job and individual notification records exist in DB
+        async with async_session() as db:
+            # Check if job exists
+            job = await db.get(NotificationJob, payload.job_id)
+            if not job:
+                job = NotificationJob(
+                    job_id=payload.job_id,
+                    channel=payload.channel,
+                    total=1,
+                    sent=0,
+                    failed=0,
+                    retrying=0,
+                    completed=False,
+                )
+                db.add(job)
+                await db.flush()
+
+            # Check if individual notification exists
+            from sqlalchemy import select
+            result = await db.execute(
+                select(IndividualNotification).where(
+                    IndividualNotification.id == payload.notification_id
+                )
+            )
+            ind = result.scalars().first()
+            if not ind:
+                ind = IndividualNotification(
+                    id=payload.notification_id,
+                    job_id=payload.job_id,
+                    recipient=payload.recipient,
+                    status="queued",
+                    attempt=payload.attempt,
+                    subject=payload.subject,
+                    body=payload.body,
+                    html_body=payload.html_body,
+                    title=payload.title,
+                    data=payload.data,
+                    priority=payload.priority,
+                    message_type=payload.message_type,
+                )
+                db.add(ind)
+                await db.flush()
+            await db.commit()
+
+        # Determine the channel process queue
+        base_channel = payload.channel
+        if base_channel == "whatsapp":
+            base_channel = "push"
+        channel_q_name = f"{base_channel}.process"
+
+        # Publish the message to the channel process queue
+        await publish(payload, routing_key=channel_q_name)
+        logger.info(
+            "Forwarded job %s from priority %s to channel queue %s",
+            payload.job_id,
+            payload.priority,
+            channel_q_name,
+        )
+
+
+async def process_channel_message(message: aio_pika.IncomingMessage) -> None:
+    # Set requeue=False so that if exception is raised, it is rejected
+    async with message.process(requeue=False):
+        body_dict = json.loads(message.body.decode())
+        msg_str = json.dumps(body_dict, indent=2)
+        print(f"\n[CHANNEL QUEUE] Processing message: {msg_str}\n")
+        payload = NotifyPayload(**body_dict)
+
+        base_channel = payload.channel
+        if base_channel == "whatsapp":
+            base_channel = "push"
+
         try:
             await dispatch(payload)
-            logger.info("Sent %s to %s (job %s)", payload.channel, payload.recipient, payload.job_id)
-            # TODO: update notification_jobs table — increment sent count
+            logger.info(
+                "Sent %s to %s (job %s)",
+                payload.channel,
+                payload.recipient,
+                payload.job_id,
+            )
+
+            # Update database to sent
+            async with async_session() as db:
+                from sqlalchemy import select, func
+                ind = await db.get(
+                    IndividualNotification, payload.notification_id
+                )
+                if ind:
+                    ind.status = "sent"
+                    ind.attempt = payload.attempt
+                    await db.flush()
+
+                # Update main job metrics
+                counts_res = await db.execute(
+                    select(
+                        IndividualNotification.status,
+                        func.count(IndividualNotification.id),
+                    )
+                    .where(IndividualNotification.job_id == payload.job_id)
+                    .group_by(IndividualNotification.status)
+                )
+                counts = dict(counts_res.all())
+
+                job = await db.get(NotificationJob, payload.job_id)
+                if job:
+                    job.sent = counts.get("sent", 0)
+                    job.failed = counts.get("failed", 0)
+                    job.retrying = counts.get("retrying", 0)
+                    if job.sent + job.failed >= job.total:
+                        job.completed = True
+                await db.commit()
+
         except Exception as exc:
-            logger.warning("Failed attempt %d for job %s: %s", payload.attempt, payload.job_id, exc)
+            logger.warning(
+                "Failed attempt %d for job %s: %s",
+                payload.attempt,
+                payload.job_id,
+                exc,
+            )
             if payload.attempt < payload.max_attempts:
-                # Get the targeted delay period from the mapping dictionary
-                delay_seconds = RETRY_DELAYS.get(payload.attempt, 0)
+                next_attempt = payload.attempt + 1
+                delay_sec = {2: 60, 3: 300, 4: 1800}.get(next_attempt, 60)
+                retry_q_name = f"{base_channel}.retry.{delay_sec}s"
 
-                if delay_seconds > 0:
-                    logger.info("Waiting %d seconds before re-queuing job %s...", delay_seconds, payload.job_id)
-                    await asyncio.sleep(delay_seconds)
+                async with async_session() as db:
+                    from sqlalchemy import select, func
+                    ind = await db.get(
+                        IndividualNotification, payload.notification_id
+                    )
+                    if ind:
+                        ind.status = "retrying"
+                        ind.attempt = payload.attempt
+                        await db.flush()
 
-                # Re-enqueue with incremented attempt count
-                payload.attempt += 1
-                await publish(payload)
+                    counts_res = await db.execute(
+                        select(
+                            IndividualNotification.status,
+                            func.count(IndividualNotification.id),
+                        )
+                        .where(IndividualNotification.job_id == payload.job_id)
+                        .group_by(IndividualNotification.status)
+                    )
+                    counts = dict(counts_res.all())
+
+                    job = await db.get(NotificationJob, payload.job_id)
+                    if job:
+                        job.sent = counts.get("sent", 0)
+                        job.failed = counts.get("failed", 0)
+                        job.retrying = counts.get("retrying", 0)
+                    await db.commit()
+
+                payload.attempt = next_attempt
+                await publish(payload, routing_key=retry_q_name)
+                logger.info(
+                    "Enqueued retry attempt %d to %s",
+                    next_attempt,
+                    retry_q_name,
+                )
             else:
-                logger.error("Permanently failed job %s channel %s", payload.job_id, payload.channel)
-                # TODO: update notification_jobs table — increment failed count
-                # TODO: publish to *.failed queue for investigation
+                logger.error(
+                    "Permanently failed job %s channel %s",
+                    payload.job_id,
+                    payload.channel,
+                )
+                async with async_session() as db:
+                    from sqlalchemy import select, func
+                    ind = await db.get(
+                        IndividualNotification, payload.notification_id
+                    )
+                    if ind:
+                        ind.status = "failed"
+                        ind.attempt = payload.attempt + 1
+                        await db.flush()
+
+                    counts_res = await db.execute(
+                        select(
+                            IndividualNotification.status,
+                            func.count(IndividualNotification.id),
+                        )
+                        .where(IndividualNotification.job_id == payload.job_id)
+                        .group_by(IndividualNotification.status)
+                    )
+                    counts = dict(counts_res.all())
+
+                    job = await db.get(NotificationJob, payload.job_id)
+                    if job:
+                        job.sent = counts.get("sent", 0)
+                        job.failed = counts.get("failed", 0)
+                        job.retrying = counts.get("retrying", 0)
+                        if job.sent + job.failed >= job.total:
+                            job.completed = True
+                    await db.commit()
+
+                # Publish to failed queue
+                failed_q_name = f"{base_channel}.failed"
+                await publish(payload, routing_key=failed_q_name)
+                logger.info(
+                    "Enqueued permanently failed message to %s", failed_q_name
+                )
 
 
 async def run_consumer() -> None:
@@ -91,14 +275,70 @@ async def run_consumer() -> None:
         channel = await connection.channel()
         await channel.set_qos(prefetch_count=10)
 
-        # Added whatsapp.process here so it matches the channel dispatch cases
-        for queue_name in ["email.process", "sms.process", "push.process", "whatsapp.process"]:
-            queue = await channel.declare_queue(queue_name, durable=True)
-            await queue.consume(process_message)
+        # 1. Declare DLX and DLQ for main priority queues
+        dlx = await channel.declare_exchange(
+            "dla.exchange",
+            aio_pika.ExchangeType.DIRECT,
+            durable=True
+        )
+        dla_queue = await channel.declare_queue(
+            "dla",
+            durable=True
+        )
+        await dla_queue.bind(dlx, routing_key="dla")
+
+        # 2. Declare Main Exchange
+        exchange = await channel.declare_exchange(
+            "notification.exchange",
+            aio_pika.ExchangeType.DIRECT,
+            durable=True
+        )
+
+        # 3. Declare and bind priority queues
+        for priority in ["high", "medium", "low"]:
+            queue = await channel.declare_queue(
+                priority,
+                durable=True,
+                arguments={
+                    "x-dead-letter-exchange": "dla.exchange",
+                    "x-dead-letter-routing-key": "dla",
+                }
+            )
+            await queue.bind(exchange, routing_key=priority)
+            await queue.consume(process_priority_message)
+
+        # 4. Declare channel-specific process, failed, and retry queues
+        for base in ["email", "sms", "push", "whatsapp"]:
+            process_q_name = f"{base}.process"
+            failed_q_name = f"{base}.failed"
+
+            # Declare process queue
+            process_queue = await channel.declare_queue(
+                process_q_name, durable=True
+            )
+            # Bind consumer to process queue
+            await process_queue.consume(process_channel_message)
+
+            # Declare failed queue
+            await channel.declare_queue(failed_q_name, durable=True)
+
+            # Declare retry queues
+            for delay in [60, 300, 1800]:
+                retry_q_name = f"{base}.retry.{delay}s"
+                await channel.declare_queue(
+                    retry_q_name,
+                    durable=True,
+                    arguments={
+                        "x-dead-letter-exchange": "",
+                        "x-dead-letter-routing-key": process_q_name,
+                        "x-message-ttl": delay * 1000,
+                    }
+                )
 
         logger.info("Notify worker started. Waiting for messages...")
         await asyncio.Future()  # run forever
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(run_consumer())

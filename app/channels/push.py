@@ -1,49 +1,38 @@
-import logging
-import firebase_admin
-from firebase_admin import credentials, messaging
-from typing import Any, Optional
+"""
+Push notification channel — Firebase FCM (Android) + AWS SNS APNs (iOS).
 
-logger = logging.getLogger(__name__)
+Students: implement send_push() using firebase-admin and boto3.
+"""
 
-# Initialize Firebase Admin SDK (Only once)
-try:
-    # Changed path from "app/firebase-credentials.json" to "firebase-credentials.json"
-    # because the file is sitting in your root directory next to main.py
-    cred = credentials.Certificate("firebase-credentials.json")
-    firebase_admin.initialize_app(cred)
-    logger.info("Firebase Admin SDK successfully initialized!")
-except ValueError:
-    pass  # Already initialized
-except Exception as e:
-    logger.error(f"Failed to load Firebase credentials file: {e}")
 
-async def send_push(
-    device_token: str, 
-    title: str, 
-    body: str, 
-    data: Optional[dict[str, Any]] = None
-) -> None:
-    """Sends a real push notification to a mobile device via FCM."""
-    if not device_token:
-        logger.warning("Skipping push notification: No device token provided.")
-        return
+def send_push(
+    device_token: str, title: str, body: str, data: dict | None = None
+) -> str:
+    """
+    Send a push notification via Firebase FCM.
 
-    logger.info(f"Connecting to Firebase to send push to token: {device_token[:10]}...")
+    Returns the FCM message ID on success.
 
-    # Build the real FCM payload
-    message = messaging.Message(
-        notification=messaging.Notification(
-            title=title,
-            body=body,
-        ),
-        data=data or {},
-        token=device_token,
+    TODO:
+      import base64, json, firebase_admin
+      from firebase_admin import credentials, messaging
+
+      # Initialise once (use a module-level flag to avoid re-init)
+      if not firebase_admin._apps:
+          sa_json = json.loads(
+              base64.b64decode(settings.firebase_service_account_json)
+          )
+          cred = credentials.Certificate(sa_json)
+          firebase_admin.initialize_app(cred)
+
+      message = messaging.Message(
+          notification=messaging.Notification(title=title, body=body),
+          data=data or {},
+          token=device_token,
+      )
+      return messaging.send(message)
+    """
+    raise NotImplementedError(
+        "Install firebase-admin and implement send_push() "
+        "in app/channels/push.py"
     )
-
-    try:
-        # Hand it off to Firebase
-        response = messaging.send(message)
-        logger.info(f"Firebase successfully accepted message! ID: {response}")
-    except Exception as e:
-        logger.error(f"Firebase Cloud Messaging delivery failed: {e}")
-        raise e

@@ -9,9 +9,7 @@ Provides:
 """
 from __future__ import annotations
 
-import asyncio
-
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
 from app.queue.job_store import job_store
@@ -27,22 +25,30 @@ from app.workers import (
     file_worker,
     rag_worker,
     sms_worker,
+    whatsapp_worker,
 )
+from app.security import verify_jwt_token
 
-router = APIRouter(prefix="/jobs", tags=["jobs"])
+router = APIRouter(
+    prefix="/jobs",
+    tags=["jobs"],
+    dependencies=[Depends(verify_jwt_token)],
+)
 
 _WORKER_MAP = {
     JobType.FILE_UPLOAD:    file_worker.enqueue,
     JobType.RAG_BULK_INGEST: rag_worker.enqueue,
     JobType.BULK_EMAIL:     email_worker.enqueue,
     JobType.BULK_SMS:       sms_worker.enqueue,
+    JobType.BULK_WHATSAPP:  whatsapp_worker.enqueue,
     JobType.ANALYTICS:      analytics_worker.enqueue,
 }
 
 
 @router.post("/submit", status_code=202)
 async def submit_job(body: SubmitJobRequest):
-    """Submit a job — immediately returns the job_id, processing happens async."""
+    """Submit a job — immediately returns the job_id, processing happens async.
+    """
     queue = QUEUE_FOR_TYPE[body.job_type.value]
     job = Job(
         job_type=body.job_type,
@@ -94,7 +100,8 @@ async def stream_events():
 
 @router.get("/stats")
 async def queue_stats():
-    """Snapshot of per-queue counts — suitable for polling every few seconds."""
+    """Snapshot of per-queue counts — suitable for polling every few seconds.
+    """
     return {"queues": list(job_store.stats().values())}
 
 

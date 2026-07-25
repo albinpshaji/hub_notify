@@ -16,6 +16,7 @@ class JobType(str, Enum):
     RAG_BULK_INGEST = "rag_bulk_ingest"
     BULK_EMAIL = "bulk_email"
     BULK_SMS = "bulk_sms"
+    BULK_WHATSAPP = "bulk_whatsapp"
     ANALYTICS = "analytics"
 
 
@@ -31,6 +32,7 @@ QUEUE_FOR_TYPE: dict[str, str] = {
     "rag_bulk_ingest": "rag.bulk_ingest",
     "bulk_email":      "notify.bulk_email",
     "bulk_sms":        "notify.bulk_sms",
+    "bulk_whatsapp":   "notify.bulk_whatsapp",
     "analytics":       "analytics.events",
     "email":           "email.process",
     "sms":             "sms.process",
@@ -42,6 +44,7 @@ ALL_QUEUES = [
     "rag.bulk_ingest",
     "notify.bulk_email",
     "notify.bulk_sms",
+    "notify.bulk_whatsapp",
     "analytics.events",
     "email.process",
     "sms.process",
@@ -71,11 +74,12 @@ class SubmitJobRequest(BaseModel):
     payload: dict = {}
 
 
-# ── Legacy payload (backward compat with existing notify router) ──────────────
+# ── Legacy payload (backward compat with existing notify router) ──────────
 
 class NotifyPayload(BaseModel):
     """A single notification task — published to RabbitMQ as JSON."""
-    job_id: str
+    job_id: str | None = None
+    notification_id: str | None = None
     channel: str            # 'email' | 'sms' | 'push' | 'whatsapp'
     recipient: str          # email address, phone number, or FCM token
     subject: str | None = None
@@ -85,3 +89,5 @@ class NotifyPayload(BaseModel):
     data: dict | None = None    # for push notification data payload
     attempt: int = 1
     max_attempts: int = 4
+    priority: str = "high"
+    message_type: str = "general"
