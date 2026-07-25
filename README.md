@@ -82,12 +82,13 @@ cp .env.example .env
 ```bash
 uvicorn app.main:app --reload --port 8001
 ```
+*(Note: FastAPI's lifespan automatically starts background queue consumers on server startup.)*
 
-### 5. Run the queue worker (separate process)
+### 5. Run the queue worker (optional dedicated process)
 
 ```bash
-python -m app.queue.worker
-# This starts async consumers for email.process, sms.process, push.process
+python -m app.queue.consumer
+# Starts standalone async consumers for email, sms, push, and whatsapp queues
 ```
 
 ---
@@ -332,12 +333,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Start both the HTTP API and the queue worker via a process manager
-RUN pip install supervisor
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-
 EXPOSE 8001
-CMD ["/usr/bin/supervisord"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
 ```
 
 ---
