@@ -1,6 +1,6 @@
 """
-Bulk WhatsApp worker — dispatches WhatsApp messages to a large list of recipients
-(stubbed locally — no real Twilio credentials required for demo).
+Bulk WhatsApp worker — dispatches WhatsApp messages to a large list
+of recipients (stubbed locally — no real Twilio credentials required for demo).
 
 Queue: notify.bulk_whatsapp
 """

@@ -9,7 +9,8 @@ security_scheme = HTTPBearer(auto_error=False)
 
 
 async def verify_jwt_token(
-    credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
+    credentials: HTTPAuthorizationCredentials
+    | None = Depends(security_scheme),
     token: str | None = Query(None),
 ) -> dict:
     """
